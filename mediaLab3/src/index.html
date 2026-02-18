@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>AR Saulė (Three.js + AR.js)</title>
+
+  <script src="js/three.js"></script>
+  <script src="jsartoolkit5/artoolkit.min.js"></script>
+  <script src="jsartoolkit5/artoolkit.api.js"></script>
+  <script src="threex/threex-artoolkitsource.js"></script>
+  <script src="threex/threex-artoolkitcontext.js"></script>
+  <script src="threex/threex-arbasecontrols.js"></script>
+  <script src="threex/threex-armarkercontrols.js"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #111; font-family: monospace; }
+    #hint {
+      position: fixed; left: 10px; top: 10px;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(0,0,0,0.45); color: #fff; font-size: 12px;
+      backdrop-filter: blur(6px);
+      user-select: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hint">Parodyk <b>Hiro</b> markerį kamerai – pamatysi besisukančią „saulę“.</div>
+
+ <script>
+  let scn, cam, rnd, clk;
+  let src, ctx;
+  let anchor, sunRig;
+
+  let coreSphere;
+  const rays = [];
+  const plasmaLoops = [];
+
+  // kilpų atnaujinimo “throttle”
+  let loopRebuildAcc = 0;
+
+  boot();
+  loop();
+
+  function boot() {
+    scn = new THREE.Scene();
+    cam = new THREE.Camera();
+    scn.add(cam);
+
+    rnd = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    rnd.setClearColor(new THREE.Color("lightgrey"), 0);
+    rnd.setSize(640, 480);
+    rnd.domElement.style.position = "absolute";
+    rnd.domElement.style.left = "0px";
+    rnd.domElement.style.top = "0px";
+    document.body.appendChild(rnd.domElement);
+
+    clk = new THREE.Clock();
+
+    scn.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 0.9);
+    key.position.set(1.2, 2.5, 1.8);
+    scn.add(key);
+
+    src = new THREEx.ArToolkitSource({ sourceType: "webcam" });
+
+    const handleResize = () => {
+      src.onResize();
+      src.copySizeTo(rnd.domElement);
+      if (ctx && ctx.arController) src.copySizeTo(ctx.arController.canvas);
+    };
+
+    src.init(() => handleResize());
+    window.addEventListener("resize", handleResize);
+
+    ctx = new THREEx.ArToolkitContext({
+      cameraParametersUrl: "data/camera_para.dat",
+      detectionMode: "mono"
+    });
+
+    ctx.init(() => {
+      cam.projectionMatrix.copy(ctx.getProjectionMatrix());
+    });
+
+    anchor = new THREE.Group();
+    scn.add(anchor);
+
+    new THREEx.ArMarkerControls(ctx, anchor, {
+      type: "pattern",
+      patternUrl: "data/hiro.patt"
+    });
+
+    sunRig = new THREE.Group();
+    sunRig.position.y = 0.6;
+    anchor.add(sunRig);
+
+    buildSun();
+  }
+
+  function buildSun() {
+    // ===== core =====
+    const coreGeo = new THREE.SphereGeometry(0.35, 32, 24);
+    const coreMat = new THREE.MeshPhongMaterial({
+      color: 0xffc44d,
+      emissive: 0xff7a00,
+      emissiveIntensity: 0.8,
+      shininess: 140
+    });
+    coreSphere = new THREE.Mesh(coreGeo, coreMat);
+    sunRig.add(coreSphere);
+
+    // ===== rays (cones) =====
+    // ČIA: +90° offsetas aplink saulę
+    const rayCount = 20;
+    const angleOffset = Math.PI / 2; // 90° aplink saulę (tai, ką tu turėjai omeny)
+    const baseDir = new THREE.Vector3(0, 1, 0); // ConeGeometry “ašis” yra +Y
+
+    for (let i = 0; i < rayCount; i++) {
+      const h = 0.22 + Math.random() * 0.22;
+      const r = 0.045 + Math.random() * 0.035;
+
+      // Padarom, kad kūgio “pagrindas” būtų ties (0,0,0), o “smaigalys” į +Y
+      const g = new THREE.ConeGeometry(r, h, 18, 1);
+      g.translate(0, h / 2, 0);
+
+      const m = new THREE.MeshPhongMaterial({
+        color: 0xffb300,
+        emissive: 0xff6a00,
+        emissiveIntensity: 0.5,
+        transparent: true,
+        opacity: 0.95
+      });
+
+      const cone = new THREE.Mesh(g, m);
+
+      const a = (i / rayCount) * Math.PI * 2 + angleOffset;
+      const radius = 0.54;
+
+      const px = Math.cos(a) * radius;
+      const pz = Math.sin(a) * radius;
+      const py = (Math.random() - 0.5) * 0.10;
+
+      cone.position.set(px, py, pz);
+
+      // Nukreipiam smaigalį radialiai į išorę XZ plokštumoje
+      const dir = new THREE.Vector3(px, 0, pz).normalize();
+      cone.quaternion.setFromUnitVectors(baseDir, dir);
+
+      cone.userData = {
+        phase: Math.random() * Math.PI * 2,
+        wobble: 0.8 + Math.random() * 1.6,
+        baseScale: 0.8 + Math.random() * 0.45
+      };
+
+      sunRig.add(cone);
+      rays.push(cone);
+    }
+
+    // ===== plasma loops (daugiau + įvairių dydžių) =====
+    // darom 2 “žiedus”: arčiau ir toliau nuo saulės, su skirtingais aukščiais/storiais
+    const loopsInner = 10;
+    const loopsOuter = 12;
+
+    addPlasmaLoopRing(loopsInner, {
+      radiusMin: 0.42, radiusMax: 0.52,
+      heightMin: 0.10, heightMax: 0.22,
+      wiggleMin: 0.06, wiggleMax: 0.14,
+      tubeMin: 0.010, tubeMax: 0.016,
+      opacityMin: 0.45, opacityMax: 0.70
+    });
+
+    addPlasmaLoopRing(loopsOuter, {
+      radiusMin: 0.52, radiusMax: 0.66,
+      heightMin: 0.18, heightMax: 0.40,
+      wiggleMin: 0.10, wiggleMax: 0.22,
+      tubeMin: 0.010, tubeMax: 0.020,
+      opacityMin: 0.35, opacityMax: 0.65
+    });
+  }
+
+  function addPlasmaLoopRing(count, cfg) {
+    for (let i = 0; i < count; i++) {
+      const baseAngle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+
+      const baseRadius = rand(cfg.radiusMin, cfg.radiusMax);
+      const height = rand(cfg.heightMin, cfg.heightMax);
+      const wiggle = rand(cfg.wiggleMin, cfg.wiggleMax);
+      const tubeR = rand(cfg.tubeMin, cfg.tubeMax);
+      const opacity = rand(cfg.opacityMin, cfg.opacityMax);
+
+      const curve = makePlasmaCurve(baseAngle, baseRadius, height, wiggle);
+
+      // mažiau segmentų = lengviau performance, bet dar gražu
+      const tube = new THREE.TubeGeometry(curve, 48, tubeR, 10, false);
+
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff4d2e,
+        transparent: true,
+        opacity: opacity
+      });
+
+      const mesh = new THREE.Mesh(tube, mat);
+
+      mesh.userData = {
+        baseAngle,
+        baseRadius,
+        height,
+        wiggle,
+        tubeR,
+        seed: Math.random() * 20.0,
+        spin: (Math.random() < 0.5 ? -1 : 1) * (0.10 + Math.random() * 0.35),
+        // kiekvienai kilpai unikalus “temperamentas”
+        freqA: 0.7 + Math.random() * 1.2,
+        freqB: 1.2 + Math.random() * 1.8
+      };
+
+      sunRig.add(mesh);
+      plasmaLoops.push(mesh);
+    }
+  }
+
+  function makePlasmaCurve(angle, radius, height, wiggle) {
+    const pts = [];
+    const segments = 18;
+
+    for (let i = 0; i <= segments; i++) {
+      const u = i / segments;            // 0..1
+      const arc = Math.sin(u * Math.PI); // 0..1..0
+      const y = arc * height;
+
+      const w = Math.sin(u * Math.PI * 2) * wiggle;
+      const rr = radius + w * 0.35;
+
+      const x = Math.cos(angle) * rr;
+      const z = Math.sin(angle) * rr;
+
+      pts.push(new THREE.Vector3(
+        x + Math.cos(angle + Math.PI/2) * w * 0.25,
+        y,
+        z + Math.sin(angle + Math.PI/2) * w * 0.25
+      ));
+    }
+
+    return new THREE.CatmullRomCurve3(pts);
+  }
+
+  function step(dt, t) {
+    if (src.ready) ctx.update(src.domElement);
+    if (!anchor.visible) return;
+
+    coreSphere.rotation.y += dt * 0.95;
+    coreSphere.rotation.x += dt * 0.30;
+
+    // bendras lėtas sukimas
+    sunRig.rotation.y += dt * 0.45;
+
+    // ray “kvėpavimas”
+    for (const r of rays) {
+      const w = 1.0 + Math.sin(t * (2.0 * r.userData.wobble) + r.userData.phase) * 0.20;
+      r.scale.set(
+        r.userData.baseScale * w,
+        r.userData.baseScale * (0.75 + w * 0.55),
+        r.userData.baseScale * w
+      );
+    }
+
+    // kilpų geometriją perstatom rečiau (kad kilpų būtų daug ir nestringtų)
+    loopRebuildAcc += dt;
+    const rebuildEvery = 0.06; // ~16 kartų per sekundę
+    if (loopRebuildAcc >= rebuildEvery) {
+      loopRebuildAcc = 0;
+
+      for (const loopMesh of plasmaLoops) {
+        loopMesh.rotation.y += rebuildEvery * loopMesh.userData.spin;
+
+        const seed = loopMesh.userData.seed;
+
+        const a = loopMesh.userData.baseAngle
+          + Math.sin(t * loopMesh.userData.freqA + seed) * 0.25;
+
+        const r = loopMesh.userData.baseRadius
+          + Math.sin(t * loopMesh.userData.freqB + seed) * 0.04;
+
+        const h = loopMesh.userData.height
+          * (0.85 + Math.sin(t * (1.1 + loopMesh.userData.freqA) + seed) * 0.20);
+
+        const w = loopMesh.userData.wiggle
+          * (0.80 + Math.sin(t * (1.7 + loopMesh.userData.freqB) + seed) * 0.25);
+
+        const newCurve = makePlasmaCurve(a, r, h, w);
+        const newTube = new THREE.TubeGeometry(newCurve, 48, loopMesh.userData.tubeR, 10, false);
+
+        loopMesh.geometry.dispose();
+        loopMesh.geometry = newTube;
+
+        // mirgėjimas
+        loopMesh.material.opacity = clamp(
+          loopMesh.material.opacity * 0.85
+          + (0.35 + 0.30 * (0.5 + 0.5 * Math.sin(t * 3.2 + seed))) * 0.15,
+          0.20, 0.85
+        );
+      }
+    }
+  }
+
+  function loop() {
+    requestAnimationFrame(loop);
+    const dt = clk.getDelta();
+    const t = clk.elapsedTime;
+    step(dt, t);
+    rnd.render(scn, cam);
+  }
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+</script>
+</body>
+</html>
+
